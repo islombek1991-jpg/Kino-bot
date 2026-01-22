@@ -1,4 +1,1 @@
-pip==23.2.1
-setuptools<65
-wheel
-aiogram==2.25.1
+aiogram==2.23.1
