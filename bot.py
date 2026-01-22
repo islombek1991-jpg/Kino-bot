@@ -1,441 +1,394 @@
 import os
+import re
 import sqlite3
-from datetime import datetime
+import random
+from typing import List, Optional, Tuple
 
 from telegram import (
     Update,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# =========================
+#   ENV / SETTINGS
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
+DB_PATH = os.getenv("DB_PATH", "data.db").strip()
+
+# Majburiy obuna kanallari (usernamelar)
+# Masalan: @IsboySkinolar_olami
+FORCE_CHANNELS_RAW = os.getenv("FORCE_CHANNELS", "@IsboySkinolar_olami").strip()
+
+# --- validations ---
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi (Railway Variables ga qo'ying)")
-
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 if OWNER_ID == 0:
     raise ValueError("OWNER_ID topilmadi (Railway Variables ga qo'ying)")
 
-# SQLite fayl yo'li (Railway Volume ishlatsang /data juda yaxshi)
-DB_PATH = os.getenv("DB_PATH", "data.db")
+def parse_admin_ids(raw: str) -> List[int]:
+    # raw: "5491302235,123456"
+    ids = []
+    for x in raw.split(","):
+        x = x.strip()
+        if x.isdigit():
+            ids.append(int(x))
+    return ids
 
-# ===== DB =====
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
+ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
+if OWNER_ID not in ADMIN_IDS:
+    ADMIN_IDS = [OWNER_ID] + ADMIN_IDS
 
-def init_db():
-    conn = db()
-    cur = conn.cursor()
+def parse_channels(raw: str) -> List[str]:
+    # "@a,@b" yoki "@a"
+    chans = []
+    for c in raw.split(","):
+        c = c.strip()
+        if not c:
+            continue
+        if not c.startswith("@"):
+            c = "@" + c
+        chans.append(c)
+    # duplicate remove
+    uniq = []
+    for c in chans:
+        if c not in uniq:
+            uniq.append(c)
+    return uniq
+
+FORCE_CHANNELS = parse_channels(FORCE_CHANNELS_RAW)
+
+
+# =========================
+#   DB
+# =========================
+def db_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def db_init():
+    con = db_conn()
+    cur = con.cursor()
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS admins(
-        user_id INTEGER PRIMARY KEY,
-        added_at TEXT
-      )
+        CREATE TABLE IF NOT EXISTS movies (
+            code TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            added_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
     """)
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS channels(
-        username TEXT PRIMARY KEY,
-        added_at TEXT
-      )
+        CREATE TABLE IF NOT EXISTS meta (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        )
     """)
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS movies(
-        code TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        link TEXT NOT NULL,
-        added_at TEXT NOT NULL
-      )
-    """)
-    # OWNER ni admin qilamiz
-    cur.execute("INSERT OR IGNORE INTO admins(user_id, added_at) VALUES(?,?)",
-                (OWNER_ID, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+    con.commit()
+    con.close()
 
-def is_admin(user_id: int) -> bool:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
-    ok = cur.fetchone() is not None
-    conn.close()
-    return ok
-
-def add_admin(user_id: int):
-    conn = db()
-    conn.execute("INSERT OR IGNORE INTO admins(user_id, added_at) VALUES(?,?)",
-                 (user_id, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-
-def del_admin(user_id: int):
-    if user_id == OWNER_ID:
-        return
-    conn = db()
-    conn.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def list_admins():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM admins ORDER BY user_id ASC")
-    rows = [r[0] for r in cur.fetchall()]
-    conn.close()
-    return rows
-
-def add_channel(username: str):
-    username = username.strip()
-    if not username:
-        return
-    if username.startswith("https://t.me/"):
-        username = username.replace("https://t.me/", "").strip("/")
-    if username.startswith("@"):
-        username = username[1:]
-    conn = db()
-    conn.execute("INSERT OR IGNORE INTO channels(username, added_at) VALUES(?,?)",
-                 (username, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-
-def del_channel(username: str):
-    username = username.strip()
-    if username.startswith("@"):
-        username = username[1:]
-    conn = db()
-    conn.execute("DELETE FROM channels WHERE username=?", (username,))
-    conn.commit()
-    conn.close()
-
-def list_channels():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT username FROM channels ORDER BY username ASC")
-    rows = [r[0] for r in cur.fetchall()]
-    conn.close()
-    return rows
-
-def add_movie(code: str, title: str, link: str):
-    conn = db()
-    conn.execute(
-        "INSERT OR REPLACE INTO movies(code,title,link,added_at) VALUES(?,?,?,?)",
-        (code, title, link, datetime.utcnow().isoformat())
+def db_add_movie(code: str, title: str, url: str, added_by: int):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO movies(code,title,url,added_by) VALUES(?,?,?,?)",
+        (code, title, url, added_by),
     )
-    conn.commit()
-    conn.close()
+    con.commit()
+    con.close()
 
-def get_movie(code: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT title, link FROM movies WHERE code=?", (code,))
+def db_get_movie(code: str) -> Optional[Tuple[str, str, str]]:
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT code,title,url FROM movies WHERE code = ?", (code,))
     row = cur.fetchone()
-    conn.close()
-    return row
+    con.close()
+    if not row:
+        return None
+    return (row[0], row[1], row[2])
 
-def del_movie(code: str):
-    conn = db()
-    conn.execute("DELETE FROM movies WHERE code=?", (code,))
-    conn.commit()
-    conn.close()
-
-def list_movies(limit: int = 30):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT code, title FROM movies ORDER BY added_at DESC LIMIT ?", (limit,))
+def db_list_recent(limit: int = 30) -> List[Tuple[str, str]]:
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT code,title FROM movies ORDER BY created_at DESC LIMIT ?", (limit,))
     rows = cur.fetchall()
-    conn.close()
-    return rows
+    con.close()
+    return [(r[0], r[1]) for r in rows]
 
-def random_movie():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT code, title, link FROM movies ORDER BY RANDOM() LIMIT 1")
+def db_random_movie() -> Optional[Tuple[str, str, str]]:
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT code,title,url FROM movies ORDER BY RANDOM() LIMIT 1")
     row = cur.fetchone()
-    conn.close()
-    return row
+    con.close()
+    if not row:
+        return None
+    return (row[0], row[1], row[2])
 
-# ===== Majburiy obuna tekshirish =====
+def db_count() -> int:
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM movies")
+    n = cur.fetchone()[0]
+    con.close()
+    return int(n)
+
+
+# =========================
+#   HELPERS
+# =========================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def normalize_code(code: str) -> str:
+    # "01" -> "01" (saqlab qolamiz), "1" -> "1"
+    code = code.strip()
+    # faqat raqam bo'lsa
+    if re.fullmatch(r"\d+", code):
+        return code
+    return code
+
+def parse_add_payload(text: str) -> Optional[Tuple[str, str, str]]:
+    """
+    /add 01 | Qabir azobi | https://t.me/IsboySkinolar_olami/4
+    """
+    # /add dan keyin
+    m = re.match(r"^/add\s+(.+)$", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    payload = m.group(1).strip()
+    parts = [p.strip() for p in payload.split("|")]
+    if len(parts) != 3:
+        return None
+    code, title, url = parts
+    if not code or not title or not url:
+        return None
+    return normalize_code(code), title, url
+
 async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    channels = list_channels()
-    if not channels:
-        return True  # kanal qo'shilmagan bo'lsa tekshirmaydi
+    """
+    Foydalanuvchi FORCE_CHANNELS dagi hamma kanallarga obuna bo'lganini tekshiradi.
+    Bot kanal ichida admin bo'lishi shart (kamida 'Read Messages' bo'lsa yaxshi).
+    """
+    if not FORCE_CHANNELS:
+        return True
 
-    user_id = update.effective_user.id
+    user = update.effective_user
+    if not user:
+        return False
 
-    for ch in channels:
-        chat = f"@{ch}"
+    user_id = user.id
+
+    # admin/owner bo'lsa, tekshiruvni o'tkazib yuboramiz (xohlasang olib tashlaymiz)
+    if is_admin(user_id):
+        return True
+
+    for channel in FORCE_CHANNELS:
         try:
-            member = await context.bot.get_chat_member(chat_id=chat, user_id=user_id)
-            status = member.status  # "member", "administrator", "creator", "left", "kicked"
-            if status in ("left", "kicked"):
+            member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+            status = getattr(member, "status", None)
+            if status not in ("member", "administrator", "creator"):
                 return False
         except Exception:
-            # Bot kanalga admin qilinmagan bo'lsa yoki kanal topilmasa shu yerda yiqiladi
+            # bot kanalga kira olmasa yoki username xato bo'lsa:
+            # xavfsiz tomondan "obuna emas" deymiz
             return False
+
     return True
 
-def join_keyboard():
-    channels = list_channels()
-    buttons = []
-    for ch in channels:
-        buttons.append([InlineKeyboardButton(f"➕ @{ch} ga obuna bo‘ling", url=f"https://t.me/{ch}")])
-    buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
-    return InlineKeyboardMarkup(buttons)
+def force_sub_keyboard() -> InlineKeyboardMarkup:
+    btns = []
+    for ch in FORCE_CHANNELS:
+        link = f"https://t.me/{ch.lstrip('@')}"
+        btns.append([InlineKeyboardButton(f"➕ {ch}", url=link)])
+    btns.append([InlineKeyboardButton("✅ Obunani tekshirish", callback_data="check_sub")])
+    return InlineKeyboardMarkup(btns)
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        [["🎬 Kino qidirish", "🎲 Tasodifiy kino"],
-         ["⭐ Top kinolar", "ℹ️ Yordam"]],
-        resize_keyboard=True
-    )
 
-async def need_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔒 Botdan foydalanish uchun kanal(lar)ga obuna bo‘lish kerak.\n\n"
-        "Obuna bo‘lib, keyin ✅ Tekshirish ni bosing.",
-        reply_markup=join_keyboard()
-    )
+# =========================
+#   HANDLERS
+# =========================
+WELCOME_TEXT = (
+    "🎬 <b>Kino botga xush kelibsiz!</b>\n\n"
+    "📩 Kino kodini yuboring (masalan: <code>101</code>)\n"
+    "yoki <code>/help</code>."
+)
 
-async def cb_check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ok = await is_subscribed(update, context)
-    if ok:
-        await q.message.reply_text("✅ Rahmat! Endi kino kodini yuboring (masalan: 01).", reply_markup=main_keyboard())
-    else:
-        await q.message.reply_text("❌ Hali obuna bo‘lmadingiz yoki bot kanalni tekshira olmayapti.\n"
-                                   "Kanalga obuna bo‘ling va botni kanalga ADMIN qiling.",
-                                   reply_markup=join_keyboard())
+HELP_TEXT = (
+    "📌 <b>Buyruqlar:</b>\n"
+    "• <code>/start</code> — botni ishga tushirish\n"
+    "• <code>/help</code> — yordam\n"
+    "• <code>/top</code> — oxirgi qo‘shilgan kinolar\n"
+    "• <code>/random</code> — tasodifiy kino\n"
+    "• <code>/get 101</code> — kod bilan kino olish\n\n"
+    "👑 <b>Adminlar uchun:</b>\n"
+    "• <code>/add 01 | Qabir azobi | https://t.me/IsboySkinolar_olami/4</code>\n"
+)
 
-# ===== Handlers =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok = await is_subscribed(update, context)
-    if not ok:
-        await need_subscribe(update, context)
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_subscribed(update, context):
+        await update.message.reply_text(
+            "🔒 Avval kanal(lar)ga obuna bo‘ling, keyin davom etasiz:",
+            reply_markup=force_sub_keyboard()
+        )
         return
-
-    await update.message.reply_text(
-        "🎥 Kino botga xush kelibsiz!\n\n"
-        "📌 Kino kodini yuboring (masalan: 01)\n"
-        "🧩 Admin bo‘lsangiz /add bilan kino qo‘shasiz.",
-        reply_markup=main_keyboard()
-    )
+    await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.HTML)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📌 Buyruqlar:\n"
-        "/start — botni boshlash\n"
-        "/random — tasodifiy kino\n"
-        "/list — oxirgi 30 ta kino\n\n"
-        "👑 Admin buyruqlar:\n"
-        "/add KOD | NOMI | LINK\n"
-        "Misol: /add 01 | Qabir azobi | https://t.me/IsboySkinolar_olami/4\n"
-        "/del KOD\n"
-        "/admin_add 123456789\n"
-        "/admin_del 123456789\n"
-        "/admins\n"
-        "/ch_add @kanal\n"
-        "/ch_del @kanal\n"
-        "/channels\n\n"
-        "🔒 Majburiy obuna ishlashi uchun:\n"
-        "Botni kanalga ADMIN qilib qo‘ying."
-    )
-    await update.message.reply_text(text)
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_subscribed(update, context):
+        await update.message.reply_text(
+            "🔒 Avval kanal(lar)ga obuna bo‘ling:",
+            reply_markup=force_sub_keyboard()
+        )
+        return
+
+    rows = db_list_recent(30)
+    if not rows:
+        await update.message.reply_text("Hali kino yo‘q. Admin kino qo‘shishi kerak.")
+        return
+
+    text = "🔥 <b>Oxirgi qo‘shilgan kinolar:</b>\n\n"
+    for code, title in rows:
+        text += f"<code>{code}</code> — {title}\n"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def random_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok = await is_subscribed(update, context)
-    if not ok:
-        await need_subscribe(update, context)
+    if not await is_subscribed(update, context):
+        await update.message.reply_text(
+            "🔒 Avval kanal(lar)ga obuna bo‘ling:",
+            reply_markup=force_sub_keyboard()
+        )
         return
 
-    row = random_movie()
-    if not row:
-        await update.message.reply_text("📭 Hali kino yo‘q.")
+    m = db_random_movie()
+    if not m:
+        await update.message.reply_text("Hali kino yo‘q. Admin kino qo‘shishi kerak.")
         return
-    code, title, link = row
-    await update.message.reply_text(f"🎲 {code} — {title}\n🔗 {link}")
+    code, title, url = m
+    await update.message.reply_text(
+        f"🎲 <b>Tasodifiy kino</b>\n\n🎬 <b>{title}</b>\n🔗 {url}\n\n<code>{code}</code>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=False,
+    )
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok = await is_subscribed(update, context)
-    if not ok:
-        await need_subscribe(update, context)
+async def get_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_subscribed(update, context):
+        await update.message.reply_text(
+            "🔒 Avval kanal(lar)ga obuna bo‘ling:",
+            reply_markup=force_sub_keyboard()
+        )
         return
 
-    rows = list_movies(30)
-    if not rows:
-        await update.message.reply_text("📭 Hali kino yo‘q.")
+    if not context.args:
+        await update.message.reply_text("❌ Kod yozing. Misol: /get 101")
         return
-    msg = "⭐ Oxirgi kinolar:\n" + "\n".join([f"{c} — {t}" for c, t in rows])
-    await update.message.reply_text(msg)
+    code = normalize_code(context.args[0])
+    m = db_get_movie(code)
+    if not m:
+        await update.message.reply_text("❌ Bunday kod topilmadi.")
+        return
+    _, title, url = m
+    await update.message.reply_text(
+        f"🎬 <b>{title}</b>\n🔗 {url}",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=False,
+    )
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user = update.effective_user
+    if not user:
+        return
+    if not is_admin(user.id):
         await update.message.reply_text("⛔ Admin emassiz.")
         return
 
-    try:
-        text = update.message.text.replace("/add", "").strip()
-        code, title, link = [x.strip() for x in text.split("|")]
-        if not code or not title or not link:
-            raise ValueError()
-        add_movie(code, title, link)
-        await update.message.reply_text(f"✅ Kino qo‘shildi: {code}")
-    except:
+    payload = parse_add_payload(update.message.text)
+    if not payload:
         await update.message.reply_text(
-            "❌ Format xato.\n\n"
-            "To‘g‘ri:\n"
+            "❌ Format xato.\n\nTo‘g‘ri misol:\n"
             "/add 01 | Qabir azobi | https://t.me/IsboySkinolar_olami/4"
         )
+        return
 
-async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin emassiz.")
-        return
-    parts = update.message.text.split()
-    if len(parts) < 2:
-        await update.message.reply_text("❌ Misol: /del 01")
-        return
-    code = parts[1].strip()
-    del_movie(code)
-    await update.message.reply_text(f"🗑 O‘chirildi: {code}")
+    code, title, url = payload
+    db_add_movie(code, title, url, user.id)
+    await update.message.reply_text(f"✅ Kino qo‘shildi: {code}")
 
-async def admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # faqat OWNER admin qo'shsin
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ Faqat OWNER admin qo‘sha oladi.")
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_subscribed(update, context):
+        await update.message.reply_text(
+            "🔒 Avval kanal(lar)ga obuna bo‘ling:",
+            reply_markup=force_sub_keyboard()
+        )
         return
-    parts = update.message.text.split()
-    if len(parts) < 2:
-        await update.message.reply_text("❌ Misol: /admin_add 5491302235")
-        return
-    uid = int(parts[1])
-    add_admin(uid)
-    await update.message.reply_text(f"✅ Admin qo‘shildi: {uid}")
 
-async def admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ Faqat OWNER admin o‘chira oladi.")
-        return
-    parts = update.message.text.split()
-    if len(parts) < 2:
-        await update.message.reply_text("❌ Misol: /admin_del 123456789")
-        return
-    uid = int(parts[1])
-    del_admin(uid)
-    await update.message.reply_text(f"🗑 Admin o‘chirildi: {uid}")
+    text = (update.message.text or "").strip()
 
-async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin emassiz.")
-        return
-    ids = list_admins()
-    await update.message.reply_text("👥 Adminlar:\n" + "\n".join([str(x) for x in ids]))
-
-async def ch_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ Faqat OWNER kanal qo‘sha oladi.")
-        return
-    parts = update.message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await update.message.reply_text("❌ Misol: /ch_add @IsboySkinolar_olami")
-        return
-    add_channel(parts[1].strip())
-    await update.message.reply_text("✅ Kanal qo‘shildi. Endi botni o‘sha kanalga ADMIN qiling.")
-
-async def ch_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ Faqat OWNER kanal o‘chira oladi.")
-        return
-    parts = update.message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await update.message.reply_text("❌ Misol: /ch_del @IsboySkinolar_olami")
-        return
-    del_channel(parts[1].strip())
-    await update.message.reply_text("🗑 Kanal o‘chirildi.")
-
-async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chs = list_channels()
-    if not chs:
-        await update.message.reply_text("📭 Majburiy obuna kanali yo‘q. /ch_add bilan qo‘shasiz.")
-        return
-    await update.message.reply_text("🔒 Majburiy obuna kanallari:\n" + "\n".join([f"@{x}" for x in chs]))
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-
-    # tugmalar
-    if txt == "🎬 Kino qidirish":
-        ok = await is_subscribed(update, context)
-        if not ok:
-            await need_subscribe(update, context)
+    # faqat kod yuborsa
+    if re.fullmatch(r"\d+", text):
+        code = normalize_code(text)
+        m = db_get_movie(code)
+        if not m:
+            await update.message.reply_text("❌ Bunday kod topilmadi.")
             return
-        await update.message.reply_text("🔎 Kino kodini yuboring (masalan: 01).")
+        _, title, url = m
+        await update.message.reply_text(
+            f"🎬 <b>{title}</b>\n🔗 {url}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=False,
+        )
         return
 
-    if txt == "🎲 Tasodifiy kino":
-        await random_cmd(update, context)
+    # boshqa matn bo'lsa
+    await update.message.reply_text("❓ Kod yuboring (masalan: 101) yoki /help")
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
         return
+    await query.answer()
 
-    if txt == "⭐ Top kinolar":
-        await list_cmd(update, context)
-        return
+    if query.data == "check_sub":
+        ok = await is_subscribed(update, context)
+        if ok:
+            await query.message.reply_text("✅ Obuna tasdiqlandi! Endi kod yuboring (masalan: 101).")
+        else:
+            await query.message.reply_text("❌ Hali obuna emassiz. Avval kanal(lar)ga obuna bo‘ling.")
 
-    if txt == "ℹ️ Yordam":
-        await help_cmd(update, context)
-        return
-
-    # oddiy kod
-    ok = await is_subscribed(update, context)
-    if not ok:
-        await need_subscribe(update, context)
-        return
-
-    row = get_movie(txt)
-    if row:
-        title, link = row
-        await update.message.reply_text(f"🎬 {txt} — {title}\n🔗 {link}")
-    else:
-        await update.message.reply_text("❌ Bunday kod topilmadi. /list yoki /random.")
-
+# =========================
+#   MAIN
+# =========================
 def main():
-    init_db()
+    db_init()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("top", top_cmd))
     app.add_handler(CommandHandler("random", random_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-
-    # admin
+    app.add_handler(CommandHandler("get", get_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
-    app.add_handler(CommandHandler("del", del_cmd))
-    app.add_handler(CommandHandler("admin_add", admin_add))
-    app.add_handler(CommandHandler("admin_del", admin_del))
-    app.add_handler(CommandHandler("admins", admins_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.COMMAND, help_cmd))
+    app.add_handler(MessageHandler(filters.Regex(r"^.*$"), text_handler))
+    app.add_handler(MessageHandler(filters.ALL, lambda u, c: None))
+    app.add_handler(MessageHandler(filters.UpdateType.CALLBACK_QUERY, callback_handler))
 
-    # channels
-    app.add_handler(CommandHandler("ch_add", ch_add))
-    app.add_handler(CommandHandler("ch_del", ch_del))
-    app.add_handler(CommandHandler("channels", channels_cmd))
-
-    # callback
-    app.add_handler(CallbackQueryHandler(cb_check_sub, pattern="^check_sub$"))
-
-    # text
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    app.run_polling()
+    # PTB 20+ uchun
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
